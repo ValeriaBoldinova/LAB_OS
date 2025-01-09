@@ -1,136 +1,125 @@
-#include <windows.h>
-#include <string.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <semaphore.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
-#define BUFFER_SIZE 256
-#define SHARED_MEMORY_NAME "Local\\MySharedMemory"
-
-void HandleError(const char *message) {
-    char errorMsg[BUFFER_SIZE];
-    DWORD written;
-
-    // Form error message
-    DWORD errorCode = GetLastError();
-    int len = wsprintf(errorMsg, "%s. Error code: %lu\n", message, errorCode);
-
-    // Write error message to console
-    WriteConsole(GetStdHandle(STD_ERROR_HANDLE), errorMsg, len, &written, NULL);
-    ExitProcess(EXIT_FAILURE);
-}
-
-void WriteMessage(const char *message) {
-    DWORD written;
-    WriteConsole(GetStdHandle(STD_OUTPUT_HANDLE), message, strlen(message), &written, NULL);
-}
+#define SHM_NAME "/my_shared_memory"
+#define SEM_WRITE "/sem_write"
+#define SEM_READ "/sem_read"
+#define BUFFER_SIZE 100
 
 int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        WriteMessage("Usage: parent.exe <filename>\n");
-        return EXIT_FAILURE;
+    if (argc < 2) {
+        fprintf(stderr, "Необходимо указать имя файла в качестве аргумента.\n");
+        exit(EXIT_FAILURE);
     }
 
-    HANDLE hMapFile;                  // Handle for the file mapping
-    LPVOID lpBaseAddress;             // Pointer to the shared memory
-    HANDLE hChildProcess;             // Handle for the child process
-    PROCESS_INFORMATION pi;           // Process information
-    STARTUPINFO si;                   // Startup information
-    char filename[BUFFER_SIZE];
-    char buffer[BUFFER_SIZE];
-    DWORD written;
+    // Удаляем старые ресурсы, если они существуют
+    shm_unlink(SHM_NAME);
+    sem_unlink(SEM_WRITE);
+    sem_unlink(SEM_READ);
 
-    // Use the filename passed as a command line argument
-    strncpy(filename, argv[1], BUFFER_SIZE);
-
-    // Create shared memory
-    hMapFile = CreateFileMapping(
-            INVALID_HANDLE_VALUE,         // Use virtual memory, not a file
-            NULL,                         // Default security attributes
-            PAGE_READWRITE,               // Read and write access
-            0,                            // Maximum size (high-order DWORD)
-            BUFFER_SIZE,                  // Maximum size (low-order DWORD)
-            SHARED_MEMORY_NAME            // Name of the shared memory
-    );
-    if (hMapFile == NULL) {
-        HandleError("Failed to create shared memory");
+    // Создаем и настраиваем общую память
+    int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0644);
+    if (shm_fd == -1) {
+        perror("shm_open");
+        exit(EXIT_FAILURE);
+    }
+    if (ftruncate(shm_fd, BUFFER_SIZE) == -1) {
+        perror("ftruncate");
+        shm_unlink(SHM_NAME);
+        exit(EXIT_FAILURE);
+    }
+    char *shared_memory = mmap(NULL, BUFFER_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shared_memory == MAP_FAILED) {
+        perror("mmap");
+        shm_unlink(SHM_NAME);
+        exit(EXIT_FAILURE);
     }
 
-    // Map shared memory into the address space of the process
-    lpBaseAddress = MapViewOfFile(
-            hMapFile,                     // Handle to the shared memory
-            FILE_MAP_ALL_ACCESS,          // Read and write access
-            0,                            // Offset (high-order DWORD)
-            0,                            // Offset (low-order DWORD)
-            BUFFER_SIZE                   // Number of bytes to map
-    );
-    if (lpBaseAddress == NULL) {
-        HandleError("Failed to map shared memory");
+    // Создаем семафоры
+    sem_t *sem_write = sem_open(SEM_WRITE, O_CREAT | O_EXCL, 0644, 1);
+    sem_t *sem_read = sem_open(SEM_READ, O_CREAT | O_EXCL, 0644, 0);
+    if (sem_write == SEM_FAILED || sem_read == SEM_FAILED) {
+        perror("sem_open");
+        shm_unlink(SHM_NAME);
+        sem_unlink(SEM_WRITE);
+        sem_unlink(SEM_READ);
+        exit(EXIT_FAILURE);
     }
 
-    // Initialize shared memory with "EMPTY"
-    strncpy((char *)lpBaseAddress, "EMPTY", BUFFER_SIZE);
+    pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        munmap(shared_memory, BUFFER_SIZE);
+        shm_unlink(SHM_NAME);
+        sem_unlink(SEM_WRITE);
+        sem_unlink(SEM_READ);
+        exit(EXIT_FAILURE);
+    } else if (pid == 0) { // Дочерний процесс
+        char buffer[BUFFER_SIZE];
+        while (1) {
+            // Ожидание разрешения на чтение от родителя
+            sem_wait(sem_read);
 
-    // Initialize STARTUPINFO for the child process
-    ZeroMemory(&si, sizeof(STARTUPINFO));
-    si.cb = sizeof(STARTUPINFO);
+            // Проверяем, есть ли "end"
+            if (strcmp(shared_memory, "end") == 0) {
+                break;
+            }
 
-    ZeroMemory(&pi, sizeof(PROCESS_INFORMATION));
+            // Чтение из общей памяти
+            strncpy(buffer, shared_memory, BUFFER_SIZE);
+            buffer[BUFFER_SIZE - 1] = '\0';
 
-    // Create command line string
-    char cmdLine[BUFFER_SIZE];
-    wsprintf(cmdLine, "child.exe %s", filename);
+            // Вывод для проверки
+            printf("[Child] Прочитано из общей памяти: %s\n", buffer);
 
-    // Create child process
-    if (!CreateProcess(
-            NULL,               // Program name
-            cmdLine,            // Command line
-            NULL,               // Process security attributes
-            NULL,               // Thread security attributes
-            FALSE,              // Do not inherit handles
-            0,                  // Creation flags
-            NULL,               // Environment variables
-            NULL,               // Working directory
-            &si,                // Startup info
-            &pi)) {             // Process information
-        HandleError("Failed to create child process");
-        UnmapViewOfFile(lpBaseAddress);
-        CloseHandle(hMapFile);
-    }
-
-    hChildProcess = pi.hProcess;
-    CloseHandle(pi.hThread);
-
-    // Main loop: write data to shared memory
-    while (1) {
-        WriteMessage("Enter numbers separated by spaces (or 'end' to quit): ");
-        DWORD read;
-        if (!ReadConsole(GetStdHandle(STD_INPUT_HANDLE), buffer, BUFFER_SIZE, &read, NULL)) {
-            HandleError("Failed to read input");
-            break;
-        }
-        buffer[read - 2] = '\0';  // Remove the newline character
-
-        // Copy data to shared memory
-        strncpy((char *)lpBaseAddress, buffer, BUFFER_SIZE);
-
-        // Exit condition
-        if (strcmp(buffer, "end") == 0) {
-            break;
+            // Разрешаем родителю записывать
+            sem_post(sem_write);
         }
 
-        // Wait for child to process the data
-        while (strcmp((char *)lpBaseAddress, "EMPTY") != 0) {
-            Sleep(100);  // Wait and check again
+        // Завершаем работу
+        munmap(shared_memory, BUFFER_SIZE);
+        sem_close(sem_write);
+        sem_close(sem_read);
+        exit(EXIT_SUCCESS);
+    } else { // Родительский процесс
+        char input[BUFFER_SIZE];
+        while (1) {
+            printf("Введите числа (или end для завершения): ");
+            fgets(input, BUFFER_SIZE, stdin);
+            input[strcspn(input, "\n")] = '\0'; // Убираем символ новой строки
+
+            // Ожидание разрешения на запись
+            sem_wait(sem_write);
+
+            // Пишем в общую память
+            strncpy(shared_memory, input, BUFFER_SIZE);
+
+            // Разрешаем дочернему процессу читать
+            sem_post(sem_read);
+
+            if (strcmp(input, "end") == 0) {
+                break;
+            }
         }
+
+        // Ожидаем завершения дочернего процесса
+        wait(NULL);
+
+        // Освобождаем ресурсы
+        munmap(shared_memory, BUFFER_SIZE);
+        shm_unlink(SHM_NAME);
+        sem_close(sem_write);
+        sem_close(sem_read);
+        sem_unlink(SEM_WRITE);
+        sem_unlink(SEM_READ);
     }
-
-    // Wait for child process to finish
-    WriteMessage("Waiting for the child process to finish...\n");
-    WaitForSingleObject(hChildProcess, INFINITE);
-
-    // Cleanup
-    UnmapViewOfFile(lpBaseAddress);
-    CloseHandle(hMapFile);
-    CloseHandle(hChildProcess);
 
     return 0;
 }
