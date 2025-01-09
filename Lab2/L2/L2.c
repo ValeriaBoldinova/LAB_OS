@@ -1,230 +1,162 @@
 #include <pthread.h>
 #include <stdlib.h>
-#include <time.h>
 #include <unistd.h>
-#include <string.h>
-#include <stdarg.h>
+#include <stdio.h>
+#include <sys/time.h>
+#include <semaphore.h> 
 
-#define INT_SIZE 32
+#define BUFFER_SIZE 64
 
-// Структура для передачи данных в поток
-typedef struct {
-    int *array;
-    int start;
-    int end;
-} thread_data;
+typedef struct task_data {
+    int* numbers;
+    int range_start;
+    int range_end;
+} task_data;
 
-// Глобальные переменные для хранения минимального и максимального значений
-pthread_mutex_t mutex;
-int global_min;
-int global_max;
+int shared_min;
+int shared_max;
+sem_t active_threads;  // Семафор для ограничения потоков
+pthread_mutex_t min_max_mutex = PTHREAD_MUTEX_INITIALIZER;  // Мьютекс для защиты глобальных значений
 
-void *find_min_max(void *arg);
+void* process_range(void* arg);
+void output_number(int fd, double number);  // Для вывода времени
+void output_int(int fd, int number);  // Для вывода целых чисел
 
-int format_output(char *buffer, size_t size, const char *format, ...);
-
-int simple_itoa(char *buffer, int value);
-
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
     if (argc != 4) {
-        const char usage_msg[] = "Usage: <program_name> <array_size> <max_threads> <seed>\n";
+        const char usage_msg[] = "Usage: ./program <array_length> <max_active_threads> <random_seed>\n";
         write(STDERR_FILENO, usage_msg, sizeof(usage_msg) - 1);
-        return EXIT_FAILURE;
+        _exit(EXIT_FAILURE);
     }
 
-    int arr_size = atoi(argv[1]);
-    int max_threads = atoi(argv[2]);
-    int seed = atoi(argv[3]);
+    long array_length = atol(argv[1]);
+    int max_active_threads = atoi(argv[2]);
+    unsigned int random_seed = atoi(argv[3]);
 
-    if (arr_size <= 0 || max_threads <= 0) {
-        const char error_msg[] = "Error: Array size and max threads must be positive integers.\n";
+    if (array_length <= 0 || max_active_threads <= 0) {
+        const char error_msg[] = "Error: Array length and max threads must be positive integers.\n";
         write(STDERR_FILENO, error_msg, sizeof(error_msg) - 1);
-        return EXIT_FAILURE;
+        _exit(EXIT_FAILURE);
     }
 
-    // Инициализация массива
-    srand(seed);
-    int *array = malloc(arr_size * sizeof(int));
-    if (!array) {
-        const char alloc_fail_msg[] = "Failed to allocate memory\n";
-        write(STDERR_FILENO, alloc_fail_msg, sizeof(alloc_fail_msg) - 1);
-        return EXIT_FAILURE;
+    // Выделение памяти под массив
+    int* data_array = malloc(array_length * sizeof(int));
+    if (!data_array) {
+        const char error_msg[] = "Memory allocation failed for the array\n";
+        write(STDERR_FILENO, error_msg, sizeof(error_msg) - 1);
+        _exit(EXIT_FAILURE);
     }
 
-    for (int i = 0; i < arr_size; i++) {
-        array[i] = rand() % 1000;
+    srand(random_seed);
+    for (long i = 0; i < array_length; i++) {
+        data_array[i] = rand() % 1000;  // Заполнение массива случайными числами
     }
 
-    // Инициализация мьютекса
-    if (pthread_mutex_init(&mutex, NULL) != 0) {
-        const char mutex_fail_msg[] = "Failed to initialize mutex\n";
-        write(STDERR_FILENO, mutex_fail_msg, sizeof(mutex_fail_msg) - 1);
-        free(array);
-        return EXIT_FAILURE;
-    }
+    pthread_t* thread_pool = malloc(max_active_threads * sizeof(pthread_t));
+    task_data* tasks = malloc(max_active_threads * sizeof(task_data));
 
-    // Инициализация глобальных переменных
-    global_min = array[0];
-    global_max = array[0];
+    sem_init(&active_threads, 0, max_active_threads);
 
-    pthread_t threads[max_threads];
-    thread_data thread_data_arr[max_threads];
+    shared_min = data_array[0];
+    shared_max = data_array[0];
 
-    int chunk_size = (arr_size + max_threads - 1) / max_threads; // Округление вверх
+    struct timeval program_start, program_end;  // Структуры для времени в секундах
+    gettimeofday(&program_start, NULL);  // Засекаем время начала
 
-    clock_t start_time = clock();
+    int chunk_size = array_length / max_active_threads + (array_length % max_active_threads != 0);
+    int total_threads = 0;
 
-    // Создание потоков
-    for (int i = 0; i < max_threads; i++) {
-        thread_data_arr[i].array = array;
-        thread_data_arr[i].start = i * chunk_size;
-        thread_data_arr[i].end = (i + 1) * chunk_size;
-        if (thread_data_arr[i].end > arr_size) {
-            thread_data_arr[i].end = arr_size;
+    for (int i = 0; i < max_active_threads; i++) {
+        tasks[i].numbers = data_array;
+        tasks[i].range_start = i * chunk_size;
+        tasks[i].range_end = (i == max_active_threads - 1) ? array_length : (i + 1) * chunk_size;
+
+        sem_wait(&active_threads);
+
+        if (pthread_create(&thread_pool[i], NULL, process_range, &tasks[i]) != 0) {
+            const char error_msg[] = "Thread creation failed\n";
+            write(STDERR_FILENO, error_msg, sizeof(error_msg) - 1);
+            free(data_array);
+            _exit(EXIT_FAILURE);
         }
-
-        if (pthread_create(&threads[i], NULL, find_min_max, &thread_data_arr[i]) != 0) {
-            const char thread_fail_msg[] = "Failed to create thread\n";
-            write(STDERR_FILENO, thread_fail_msg, sizeof(thread_fail_msg) - 1);
-            free(array);
-            pthread_mutex_destroy(&mutex);
-            return EXIT_FAILURE;
-        }
+        total_threads++;
     }
 
-    // Ожидание завершения потоков
-    for (int i = 0; i < max_threads; i++) {
-        if (pthread_join(threads[i], NULL) != 0) {
-            const char join_fail_msg[] = "Failed to join thread\n";
-            write(STDERR_FILENO, join_fail_msg, sizeof(join_fail_msg) - 1);
-            free(array);
-            pthread_mutex_destroy(&mutex);
-            return EXIT_FAILURE;
+    for (int i = 0; i < total_threads; i++) {
+        if (pthread_join(thread_pool[i], NULL) != 0) {
+            const char error_msg[] = "Thread joining failed\n";
+            write(STDERR_FILENO, error_msg, sizeof(error_msg) - 1);
+            free(data_array);
+            _exit(EXIT_FAILURE);
         }
     }
 
-    clock_t end_time = clock();
+    gettimeofday(&program_end, NULL);  // Засекаем время окончания
 
-    // Вывод результатов
-    char buffer[128];
-    int len = 0;
-    len += format_output(buffer + len, sizeof(buffer) - len, "Global Min: %d\n", global_min);
-    len += format_output(buffer + len, sizeof(buffer) - len, "Global Max: %d\n", global_max);
-    len += format_output(buffer + len, sizeof(buffer) - len, "Execution Time: %f seconds\n", (double)(end_time - start_time) / CLOCKS_PER_SEC);
-    write(STDOUT_FILENO, buffer, len);
+    // Вычисляем время в секундах
+    double exec_time_seconds = (program_end.tv_sec - program_start.tv_sec) +
+                               (program_end.tv_usec - program_start.tv_usec) / 1000000.0;
 
-    // Освобождение ресурсов
-    free(array);
-    pthread_mutex_destroy(&mutex);
+    const char exec_time_msg[] = "Execution time: ";
+    write(STDOUT_FILENO, exec_time_msg, sizeof(exec_time_msg) - 1);
+    output_number(STDOUT_FILENO, exec_time_seconds);  // Выводим время в секундах
+    const char newline[] = " seconds\n";
+    write(STDOUT_FILENO, newline, sizeof(newline) - 1);
 
-    return EXIT_SUCCESS;
+    const char min_label[] = "Minimum value: ";
+    write(STDOUT_FILENO, min_label, sizeof(min_label) - 1);
+    output_int(STDOUT_FILENO, shared_min);  // Используем новую функцию для целых чисел
+    write(STDOUT_FILENO, "\n", 1);
+
+    const char max_label[] = "Maximum value: ";
+    write(STDOUT_FILENO, max_label, sizeof(max_label) - 1);
+    output_int(STDOUT_FILENO, shared_max);  // Используем новую функцию для целых чисел
+    write(STDOUT_FILENO, "\n", 1);
+
+    sem_destroy(&active_threads);
+    free(data_array);
+    free(thread_pool);
+    free(tasks);
+
+    return 0;
 }
 
-void *find_min_max(void *arg) {
-    thread_data *data = (thread_data *)arg;
-    int local_min = data->array[data->start];
-    int local_max = data->array[data->start];
+void* process_range(void* arg) {
+    task_data* task = (task_data*)arg;
 
-    for (int i = data->start; i < data->end; i++) {
-        if (data->array[i] < local_min) {
-            local_min = data->array[i];
-        }
-        if (data->array[i] > local_max) {
-            local_max = data->array[i];
-        }
+    int local_min = task->numbers[task->range_start];
+    int local_max = task->numbers[task->range_start];
+
+    for (int i = task->range_start; i < task->range_end; i++) {
+        if (task->numbers[i] < local_min)
+            local_min = task->numbers[i];
+        if (task->numbers[i] > local_max)
+            local_max = task->numbers[i];
     }
 
-    pthread_mutex_lock(&mutex);
-    if (local_min < global_min) {
-        global_min = local_min;
+    // Используем мьютекс для безопасного обновления глобальных значений
+    pthread_mutex_lock(&min_max_mutex);
+    if (local_min < shared_min) {
+        shared_min = local_min;
     }
-    if (local_max > global_max) {
-        global_max = local_max;
+    if (local_max > shared_max) {
+        shared_max = local_max;
     }
-    pthread_mutex_unlock(&mutex);
+    pthread_mutex_unlock(&min_max_mutex);
 
+    sem_post(&active_threads);
     return NULL;
 }
 
-int format_output(char *buffer, size_t size, const char *format, ...) {
-    va_list args;
-    va_start(args, format);
-
-    const char *traverse = format;
-    char *buf_ptr = buffer;
-    size_t remaining = size;
-
-    while (*traverse && remaining > 1) {
-        if (*traverse == '%') {
-            traverse++;
-            if (*traverse == 'd') {
-                int value = va_arg(args, int);
-                char temp[INT_SIZE];
-                int len = simple_itoa(temp, value);
-                if (len < remaining) {
-                    memcpy(buf_ptr, temp, len);
-                    buf_ptr += len;
-                    remaining -= len;
-                }
-            } else if (*traverse == 'f') {
-                double value = va_arg(args, double);
-                int int_part = (int)value;
-                double frac_part = value - int_part;
-                char temp[INT_SIZE];
-                int len = simple_itoa(temp, int_part);
-                if (len < remaining) {
-                    memcpy(buf_ptr, temp, len);
-                    buf_ptr += len;
-                    remaining -= len;
-                }
-                if (remaining > 2) {
-                    *buf_ptr++ = '.';
-                    remaining--;
-                    for (int i = 0; i < 6 && remaining > 1; i++) {
-                        frac_part *= 10;
-                        int digit = (int)frac_part;
-                        *buf_ptr++ = '0' + digit;
-                        frac_part -= digit;
-                        remaining--;
-                    }
-                }
-            }
-        } else {
-            *buf_ptr++ = *traverse;
-            remaining--;
-        }
-        traverse++;
-    }
-
-    *buf_ptr = '\0';
-    va_end(args);
-
-    return buf_ptr - buffer;
+void output_number(int fd, double number) {
+    char buffer[BUFFER_SIZE];
+    int length = snprintf(buffer, sizeof(buffer), "%.6f", number);  // Вывод с 6 знаками после запятой
+    write(fd, buffer, length);
 }
 
-int simple_itoa(char *buffer, int value) {
-    char temp[INT_SIZE];
-    int i = 0;
-    int is_negative = value < 0;
-
-    if (is_negative) {
-        value = -value;
-    }
-
-    do {
-        temp[i++] = '0' + (value % 10);
-        value /= 10;
-    } while (value > 0);
-
-    if (is_negative) {
-        temp[i++] = '-';
-    }
-
-    int len = i;
-    for (int j = 0; j < i; j++) {
-        buffer[j] = temp[i - j - 1];
-    }
-    buffer[len] = '\0';
-
-    return len;
+// Новая функция для вывода целых чисел
+void output_int(int fd, int number) {
+    char buffer[BUFFER_SIZE];
+    int length = snprintf(buffer, sizeof(buffer), "%d", number);  // Выводим как целое число
+    write(fd, buffer, length);
 }
